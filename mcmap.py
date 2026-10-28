@@ -13,6 +13,8 @@ Examples:
     python mcmap.py ~/minecraft/world -o nether.png --dimension nether
     python mcmap.py ./world --bounds -1000 -1000 1000 1000 --grid 256 --scale 0.5
     python mcmap.py ./world --list-unknown        # see which blocks fell back to the default color
+    python mcmap.py ./world --error-log errors.txt  # list every unreadable chunk and why
+    python mcmap.py ./world --debug-chunk 120 -340  # full dump of the chunk at block X=120 Z=-340
 
 The world can be open in-game while this runs (files are only read), but chunks Minecraft
 hasn't flushed to disk yet won't appear. Close the world or run /save-all for a complete map.
@@ -25,6 +27,7 @@ import re
 import struct
 import sys
 import time
+import traceback
 import zlib
 from collections import Counter
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -131,14 +134,63 @@ def read_nbt(buf):
 _REGION_RE = re.compile(r"^r\.(-?\d+)\.(-?\d+)\.mca$")
 
 
+def _lz4_block_decompress_py(src, dlen=None):
+    """Pure-Python LZ4 block decoder, used when the 'lz4' package isn't installed."""
+    dst = bytearray()
+    i, n = 0, len(src)
+    while i < n:
+        token = src[i]
+        i += 1
+        lit = token >> 4
+        if lit == 15:
+            while True:
+                b = src[i]
+                i += 1
+                lit += b
+                if b != 255:
+                    break
+        dst += src[i:i + lit]
+        i += lit
+        if i >= n:
+            break
+        off = src[i] | (src[i + 1] << 8)
+        i += 2
+        ml = token & 15
+        if ml == 15:
+            while True:
+                b = src[i]
+                i += 1
+                ml += b
+                if b != 255:
+                    break
+        ml += 4
+        if off == 0 or off > len(dst):
+            raise ValueError("corrupt LZ4 block (bad match offset)")
+        start = len(dst) - off
+        if off >= ml:
+            dst += dst[start:start + ml]
+        else:  # overlapping copy = repeating pattern
+            pat = bytes(dst[start:])
+            dst += (pat * (ml // off + 1))[:ml]
+    return bytes(dst)
+
+
+try:
+    import lz4.block as _lz4block
+
+    def _lz4_block(chunk, dlen):
+        return _lz4block.decompress(chunk, uncompressed_size=dlen)
+except ImportError:
+    _lz4block = None
+    _lz4_block = _lz4_block_decompress_py
+
+
 def _lz4_java_decompress(data):
     """Minecraft's LZ4 option uses lz4-java's LZ4BlockOutputStream framing."""
-    try:
-        import lz4.block
-    except ImportError:
-        raise RuntimeError("Region uses LZ4 compression; run: pip install lz4")
     out = bytearray()
     p = 0
+    if data[:8] != b"LZ4Block":
+        raise ValueError(f"LZ4 chunk without LZ4Block header (starts {bytes(data[:8])!r})")
     while p + 21 <= len(data):
         if data[p:p + 8] != b"LZ4Block":
             break
@@ -151,10 +203,15 @@ def _lz4_java_decompress(data):
         if method == 0x10:
             out += chunk
         elif method == 0x20:
-            out += lz4.block.decompress(chunk, uncompressed_size=dlen)
+            out += _lz4_block(bytes(chunk), dlen)
+        else:
+            raise ValueError(f"Unknown LZ4Block method 0x{method:02x}")
         if dlen == 0:
             break
     return bytes(out)
+
+
+COMPRESSION_NAMES = {1: "gzip", 2: "zlib", 3: "none", 4: "lz4", 127: "custom"}
 
 
 def _decompress(ctype, payload):
@@ -166,45 +223,100 @@ def _decompress(ctype, payload):
         return payload
     if ctype == 4:
         return _lz4_java_decompress(payload)
+    if ctype == 127:  # payload starts with the algorithm's name as an NBT-style string
+        try:
+            name = bytes(payload[2:2 + _S_H.unpack_from(payload, 0)[0]]).decode("utf-8", "replace")
+        except Exception:
+            name = "?"
+        raise ValueError(f"Custom compression algorithm '{name}' (set by server software)")
     raise ValueError(f"Unknown chunk compression type {ctype}")
 
 
+class ChunkError(Exception):
+    """A chunk that couldn't be read, with enough context to diagnose why."""
+
+    def __init__(self, stage, message, ctype=None, detail=None):
+        super().__init__(message)
+        self.stage, self.message, self.ctype, self.detail = stage, message, ctype, detail
+
+
+def locate_chunk(path, cx, cz, data=None):
+    """Return (data, start, length, ctype, sectors) for a chunk in a region file, or None."""
+    if data is None:
+        with open(path, "rb") as f:
+            data = f.read()
+    i = (cx & 31) + (cz & 31) * 32
+    o = i * 4
+    sector = (data[o] << 16) | (data[o + 1] << 8) | data[o + 2]
+    count = data[o + 3]
+    if sector == 0 or count == 0:
+        return None
+    start = sector * 4096
+    if start + 5 > len(data):
+        return data, start, None, None, count
+    return data, start, _S_i.unpack_from(data, start)[0], data[start + 4], count
+
+
+def read_chunk_payload(path, data, cx, cz):
+    """Return (ctype, raw_compressed_payload) or raise ChunkError."""
+    loc = locate_chunk(path, cx, cz, data)
+    if loc is None:
+        return None
+    _, start, length, ctype, sectors = loc
+    if length is None:
+        raise ChunkError("header", "chunk offset points past end of region file "
+                                   "(truncated file - backup taken mid-write?)")
+    if length <= 1 or start + 4 + length > len(data):
+        raise ChunkError("header", f"chunk length {length} runs past end of region file "
+                                   "(truncated file - backup taken mid-write?)", ctype & 0x7F)
+    if length > sectors * 4096:
+        raise ChunkError("header", f"chunk length {length} exceeds its {sectors} allocated "
+                                   "sectors (corrupt header or file copied mid-write)", ctype & 0x7F)
+    if ctype & 0x80:  # oversized chunk stored externally in c.X.Z.mcc
+        ext = os.path.join(os.path.dirname(path), f"c.{cx}.{cz}.mcc")
+        if not os.path.exists(ext):
+            raise ChunkError("header", "oversized chunk's external c.X.Z.mcc file is missing",
+                             ctype & 0x7F)
+        with open(ext, "rb") as f:
+            return ctype & 0x7F, f.read()
+    return ctype, data[start + 5:start + 4 + length]
+
+
 def iter_region_chunks(path, chunk_filter=None):
-    """Yield (cx, cz, nbt_root) for every chunk stored in a region file."""
+    """Yield (cx, cz, ctype, nbt_root_or_ChunkError) for every chunk in a region file."""
     m = _REGION_RE.match(os.path.basename(path))
     rx, rz = int(m.group(1)), int(m.group(2))
     with open(path, "rb") as f:
         data = f.read()
     if len(data) < 8192:
+        if data:
+            yield rx * 32, rz * 32, None, ChunkError(
+                "header", f"region file is only {len(data)} bytes (needs 8192+ for its header)")
         return
     for i in range(1024):
         cx = rx * 32 + (i & 31)
         cz = rz * 32 + (i >> 5)
         if chunk_filter and not chunk_filter(cx, cz):
             continue
-        o = i * 4
-        sector = (data[o] << 16) | (data[o + 1] << 8) | data[o + 2]
-        count = data[o + 3]
-        if sector == 0 or count == 0:
-            continue
-        start = sector * 4096
-        if start + 5 > len(data):
-            continue
-        length = _S_i.unpack_from(data, start)[0]
-        ctype = data[start + 4]
-        if ctype & 0x80:  # oversized chunk stored externally in c.X.Z.mcc
-            ext = os.path.join(os.path.dirname(path), f"c.{cx}.{cz}.mcc")
-            if not os.path.exists(ext):
-                continue
-            with open(ext, "rb") as f:
-                payload = f.read()
-            ctype &= 0x7F
-        else:
-            payload = data[start + 5:start + 4 + length]
         try:
-            yield cx, cz, read_nbt(memoryview(_decompress(ctype, payload)))
-        except Exception as e:  # corrupt chunk - skip it, don't kill the run
-            yield cx, cz, e
+            got = read_chunk_payload(path, data, cx, cz)
+        except ChunkError as e:
+            yield cx, cz, e.ctype, e
+            continue
+        if got is None:
+            continue
+        ctype, payload = got
+        try:
+            raw = _decompress(ctype, payload)
+        except Exception as e:
+            yield cx, cz, ctype, ChunkError(
+                "decompress", f"{COMPRESSION_NAMES.get(ctype, ctype)}: {type(e).__name__}: {e}",
+                ctype)
+            continue
+        try:
+            yield cx, cz, ctype, read_nbt(memoryview(raw))
+        except Exception as e:
+            yield cx, cz, ctype, ChunkError("nbt", f"{type(e).__name__}: {e}", ctype)
 
 
 # --------------------------------------------------------------------------------------
@@ -394,14 +506,14 @@ def unpack_indices(data, palette_len, spanning, count=4096):
 def render_chunk(root, opts, unknown):
     """
     Returns (rgb[16,16,3] uint8, height[16,16] int16, valid[16,16] bool, water[16,16] bool)
-    or None if the chunk isn't fully generated / has no blocks.
+    or a string explaining why the chunk was skipped (not generated, no blocks, ...).
     Arrays are indexed [z, x] within the chunk.
     """
     dv = root.get("DataVersion", 0)
     level = root["Level"] if "Level" in root else root
     status = str(level.get("Status", ""))
     if not opts["include_partial"] and not status.endswith("full"):
-        return None
+        return f"not fully generated (Status '{status or 'none'}')"
 
     sections = level.get("sections") or level.get("Sections") or []
     spanning = dv < 2529  # before 20w17a (1.16), values could straddle longs
@@ -422,7 +534,7 @@ def render_chunk(root, opts, unknown):
             continue
         parsed[y] = (names, data)
     if not parsed:
-        return None
+        return "no block data"
 
     lo, hi = min(parsed), max(parsed)
     H = (hi - lo + 1) * 16
@@ -455,7 +567,7 @@ def render_chunk(root, opts, unknown):
     if opts["ceiling"] is not None:
         cut = top_world_y - opts["ceiling"]
         if cut >= H:
-            return None
+            return "entirely above --ceiling"
         if cut > 0:
             K, C = K[cut:], C[cut:]
             top_world_y -= cut
@@ -492,28 +604,122 @@ def render_chunk(root, opts, unknown):
     return np.clip(rgb, 0, 255).astype(np.uint8), height, valid, water
 
 
+_DIGITS = re.compile(r"\d+")
+
+
+def _where(exc):
+    """'func:line' of the innermost frame in this file, for render-stage errors."""
+    frames = [f for f in traceback.extract_tb(exc.__traceback__)
+              if os.path.basename(f.filename) == os.path.basename(__file__)]
+    f = frames[-1] if frames else traceback.extract_tb(exc.__traceback__)[-1]
+    return f"{f.name}:{f.lineno}"
+
+
+class Stats:
+    """Per-run diagnostics, merged across worker processes."""
+
+    def __init__(self):
+        self.compression = Counter()   # compression name -> chunks
+        self.dv_ok = Counter()         # DataVersion -> chunks rendered
+        self.dv_err = Counter()        # DataVersion -> chunks that failed after parsing
+        self.skipped = Counter()       # reason -> chunks
+        self.errors = Counter()        # (stage, normalized message) -> chunks
+        self.samples = {}              # same key -> [(cx, cz, full message), ...]
+        self.log = []                  # every failure, if --error-log was given
+
+    def error(self, stage, msg, cx, cz, keep_log):
+        key = (stage, _DIGITS.sub("#", msg))
+        self.errors[key] += 1
+        s = self.samples.setdefault(key, [])
+        if len(s) < 3:
+            s.append((cx, cz, msg))
+        if keep_log:
+            self.log.append(f"chunk {cx},{cz} (blocks {cx * 16},{cz * 16})\t{stage}\t{msg}")
+
+    def merge(self, o):
+        for a in ("compression", "dv_ok", "dv_err", "skipped", "errors"):
+            getattr(self, a).update(getattr(o, a))
+        for k, v in o.samples.items():
+            s = self.samples.setdefault(k, [])
+            s.extend(v[:3 - len(s)])
+        self.log.extend(o.log)
+
+    @property
+    def error_count(self):
+        return sum(self.errors.values())
+
+
 def process_region(path, opts):
     bounds = opts["chunk_bounds"]
+    keep_log = opts["keep_log"]
     flt = None
     if bounds:
         x0, z0, x1, z1 = bounds
         flt = lambda cx, cz: x0 <= cx <= x1 and z0 <= cz <= z1  # noqa: E731
-    out, unknown, errors = [], Counter(), 0
+    out, unknown, st = [], Counter(), Stats()
     try:
-        for cx, cz, root in iter_region_chunks(path, flt):
-            if isinstance(root, Exception):
-                errors += 1
+        for cx, cz, ctype, root in iter_region_chunks(path, flt):
+            st.compression[COMPRESSION_NAMES.get(ctype, str(ctype))] += 1
+            if isinstance(root, ChunkError):
+                st.error(root.stage, root.message, cx, cz, keep_log)
                 continue
+            dv = root.get("DataVersion", 0) if isinstance(root, dict) else 0
             try:
                 r = render_chunk(root, opts, unknown)
-            except Exception:
-                errors += 1
+            except Exception as e:
+                st.dv_err[dv] += 1
+                st.error("render", f"{type(e).__name__} at {_where(e)}: {e} (DataVersion {dv})",
+                         cx, cz, keep_log)
                 continue
-            if r is not None:
+            if isinstance(r, str):
+                st.skipped[r] += 1
+            else:
+                st.dv_ok[dv] += 1
                 out.append((cx, cz) + r)
-    except Exception:
-        errors += 1
-    return out, unknown, errors
+    except Exception as e:
+        st.error("region", f"{os.path.basename(path)}: {type(e).__name__}: {e}", 0, 0, keep_log)
+    return out, unknown, st
+
+
+# Rough DataVersion -> release mapping, for the diagnostics report.
+_DV_RELEASES = [(1519, "1.13"), (1952, "1.14"), (2225, "1.15"), (2566, "1.16"), (2724, "1.17"),
+                (2860, "1.18"), (3105, "1.19"), (3463, "1.20"), (3953, "1.21+")]
+
+
+def dv_label(dv):
+    if not dv:
+        return "no DataVersion"
+    name = "pre-1.13"
+    for v, n in _DV_RELEASES:
+        if dv >= v:
+            name = n
+    return f"{dv} (~{name})"
+
+
+def print_diagnostics(st, files_count, rendered):
+    print("\n=== Diagnostics ===")
+    print("Chunk compression:", ", ".join(f"{k}={v:,}" for k, v in st.compression.most_common()))
+    if st.dv_ok:
+        print("Rendered chunks by DataVersion:")
+        for dv, n in sorted(st.dv_ok.items()):
+            print(f"  {dv_label(dv):24s} {n:,}")
+    if st.dv_err:
+        print("Failed-to-render chunks by DataVersion:")
+        for dv, n in sorted(st.dv_err.items()):
+            print(f"  {dv_label(dv):24s} {n:,}")
+    if st.skipped:
+        print("Skipped (not errors):")
+        for reason, n in st.skipped.most_common():
+            print(f"  {n:>8,}  {reason}")
+    if st.errors:
+        print("Errors, grouped by cause:")
+        for (stage, _), n in st.errors.most_common():
+            key = (stage, _)
+            print(f"  {n:>8,}  [{stage}] {st.samples[key][0][2]}")
+            ex = "; ".join(f"chunk {cx},{cz} = block {cx * 16},{cz * 16}"
+                           for cx, cz, _m in st.samples[key])
+            print(f"            e.g. {ex}")
+    print("Tip: run with --debug-chunk X Z (block coords from F3) on a failing spot for a full dump.")
 
 
 # --------------------------------------------------------------------------------------
@@ -539,11 +745,25 @@ def find_region_dir(world, dim):
     return None
 
 
+def find_level_dat(start):
+    """level.dat in the given folder or up to 5 parents (so a region folder works too)."""
+    p = start
+    for _ in range(6):
+        cand = os.path.join(p, "level.dat")
+        if os.path.isfile(cand):
+            return cand
+        parent = os.path.dirname(p)
+        if parent == p:
+            break
+        p = parent
+    return None
+
+
 def read_markers(world, dim):
     """Spawn point and singleplayer player position from level.dat, if present."""
     markers = []
-    path = os.path.join(world, "level.dat")
-    if not os.path.isfile(path):
+    path = find_level_dat(world)
+    if not path:
         return markers
     try:
         with gzip.open(path, "rb") as f:
@@ -563,6 +783,81 @@ def read_markers(world, dim):
             pos = player["Pos"]
             markers.append(("Player", int(pos[0] // 1), int(pos[2] // 1), (40, 90, 230)))
     return markers
+
+
+def debug_chunk(region_dir, bx, bz, opts):
+    """Print everything we can learn about one chunk and save its bytes for inspection."""
+    cx, cz = bx >> 4, bz >> 4
+    rx, rz = cx >> 5, cz >> 5
+    path = os.path.join(region_dir, f"r.{rx}.{rz}.mca")
+    print(f"Block {bx},{bz} -> chunk {cx},{cz} -> {path}")
+    if not os.path.isfile(path):
+        print("  Region file does not exist (never generated).")
+        return
+    print(f"  Region file size: {os.path.getsize(path):,} bytes")
+    loc = locate_chunk(path, cx, cz)
+    if loc is None:
+        print("  Chunk is not present in the region file (never generated).")
+        return
+    data, start, length, ctype, sectors = loc
+    print(f"  Header: offset {start:,}, {sectors} sector(s), length {length}, "
+          f"compression byte {ctype} ({COMPRESSION_NAMES.get((ctype or 0) & 0x7F, '?')}"
+          f"{', external .mcc' if ctype and ctype & 0x80 else ''})")
+    try:
+        ctype, payload = read_chunk_payload(path, data, cx, cz)
+    except ChunkError as e:
+        print(f"  FAILED reading payload: {e.message}")
+        return
+    base = f"chunk_{cx}_{cz}"
+    print(f"  First bytes of payload: {bytes(payload[:16]).hex(' ')}")
+    try:
+        raw = _decompress(ctype, payload)
+    except Exception:
+        with open(base + ".compressed", "wb") as f:
+            f.write(payload)
+        print("  FAILED decompressing:")
+        traceback.print_exc()
+        print(f"  Saved compressed bytes to {base}.compressed")
+        return
+    with open(base + ".nbt", "wb") as f:
+        f.write(raw)
+    print(f"  Decompressed {len(raw):,} bytes -> saved to {base}.nbt")
+    try:
+        root = read_nbt(memoryview(raw))
+    except Exception:
+        print("  FAILED parsing NBT:")
+        traceback.print_exc()
+        return
+    level = root["Level"] if "Level" in root else root
+    print(f"  DataVersion: {dv_label(root.get('DataVersion', 0))}")
+    print(f"  Layout: {'old (Level wrapper)' if 'Level' in root else 'new (1.18+)'}")
+    print(f"  Status: {level.get('Status')!r}")
+    print(f"  Top-level keys: {sorted(root.keys())}")
+    if "Level" in root:
+        print(f"  Level keys: {sorted(level.keys())}")
+    secs = level.get("sections") or level.get("Sections") or []
+    print(f"  Sections: {len(secs)}")
+    for s in secs:
+        if "block_states" in s:
+            pal, d = s["block_states"].get("palette"), s["block_states"].get("data")
+        else:
+            pal, d = s.get("Palette"), s.get("BlockStates")
+        if not pal:
+            print(f"    Y={s.get('Y')}: no palette (keys {sorted(s.keys())})")
+            continue
+        bits = max(4, (len(pal) - 1).bit_length())
+        exp = 0 if len(pal) == 1 else (4096 + 64 // bits - 1) // (64 // bits)
+        names = [p.get("Name", "?").split(":", 1)[-1] for p in pal]
+        dlen = 0 if d is None else len(d)
+        flag = "" if len(pal) == 1 or dlen in (exp, (4096 * bits + 63) // 64) else "  <-- unexpected length"
+        print(f"    Y={s.get('Y'):>3}: palette {len(pal):>3}, data longs {dlen:>4} (expect {exp})"
+              f"{flag}  e.g. {', '.join(names[:5])}")
+    try:
+        r = render_chunk(root, opts, Counter())
+        print(f"  Render: {'skipped - ' + r if isinstance(r, str) else 'OK'}")
+    except Exception:
+        print("  Render FAILED:")
+        traceback.print_exc()
 
 
 def parse_color(s):
@@ -597,6 +892,12 @@ def main():
     ap.add_argument("--workers", type=int, default=os.cpu_count() or 4)
     ap.add_argument("--list-unknown", action="store_true",
                     help="Print blocks that had no color mapping (so you can add them)")
+    ap.add_argument("--diagnostics", action="store_true",
+                    help="Always print the diagnostics report (it prints automatically on errors)")
+    ap.add_argument("--error-log", metavar="FILE",
+                    help="Write every unreadable chunk and the reason to this file")
+    ap.add_argument("--debug-chunk", nargs=2, type=int, metavar=("X", "Z"),
+                    help="Dump details for the chunk at block X Z (from F3) and exit")
     args = ap.parse_args()
 
     world = os.path.abspath(os.path.expanduser(os.path.expandvars(args.world)))
@@ -612,7 +913,11 @@ def main():
         "ceiling": args.ceiling if args.ceiling is not None else (120 if nether else None),
         "need_air_above": nether,
         "chunk_bounds": None,
+        "keep_log": bool(args.error_log),
     }
+    if args.debug_chunk:
+        debug_chunk(region_dir, args.debug_chunk[0], args.debug_chunk[1], opts)
+        return
     if args.bounds:
         x1, z1, x2, z2 = args.bounds
         x1, x2 = sorted((x1, x2))
@@ -635,16 +940,25 @@ def main():
 
     t0 = time.time()
     print(f"Reading {len(files)} region file(s) from {region_dir} using {args.workers} worker(s)...")
-    chunks, unknown, errors = [], Counter(), 0
+    if _lz4block is None:
+        print("(lz4 package not installed - LZ4 chunks will use the slower built-in decoder)")
+    chunks, unknown, stats = [], Counter(), Stats()
     with ProcessPoolExecutor(max_workers=args.workers) as pool:
         futs = [pool.submit(process_region, f, opts) for f in files]
         for n, fut in enumerate(as_completed(futs), 1):
-            c, u, e = fut.result()
+            c, u, st = fut.result()
             chunks.extend(c)
             unknown.update(u)
-            errors += e
+            stats.merge(st)
             print(f"\r  {n}/{len(files)} regions, {len(chunks):,} chunks", end="", flush=True)
     print()
+    errors = stats.error_count
+    if args.error_log:
+        with open(args.error_log, "w", encoding="utf-8") as f:
+            f.write("\n".join(sorted(stats.log)) + ("\n" if stats.log else ""))
+        print(f"Wrote {len(stats.log):,} error line(s) to {args.error_log}")
+    if errors or args.diagnostics or not chunks:
+        print_diagnostics(stats, len(files), len(chunks))
     if not chunks:
         sys.exit("No explored chunks found (try --include-partial).")
 
