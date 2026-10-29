@@ -360,9 +360,9 @@ WATERY = {"water", "bubble_column", "seagrass", "tall_seagrass", "kelp", "kelp_p
 WATER_RGB = (52, 87, 186)
 
 # Rails are drawn as solid surface blocks (they used to be looked through like grass),
-# so rail lines show up. Dark so a 1-block-wide line stands out on most terrain;
-# powered rails are gold so boosters are visible.
-RAILS = {"rail": (58, 48, 42), "powered_rail": (214, 168, 38),
+# so rail lines show up. Silver for plain rails; powered rails are gold so boosters
+# are visible; detector/activator rails are red.
+RAILS = {"rail": (192, 194, 200), "powered_rail": (214, 168, 38),
          "detector_rail": (150, 62, 50), "activator_rail": (150, 62, 50)}
 
 COLORS = {
@@ -542,6 +542,31 @@ def unpack_indices(data, palette_len, spanning, count=4096, clamp=True):
     return np.minimum(vals[:count], palette_len - 1).astype(np.intp)
 
 
+# Palette entries that were compounds with no recognizable block name, by their key set.
+# Counted per worker and reported in the diagnostics so a format change can't hide silently.
+UNNAMED_ENTRIES = Counter()
+UNNAMED_SAMPLES = {}
+
+
+def _name_from_compound(p):
+    """Find the block id in a palette compound that has no 'Name' key."""
+    for k in ("name", "id", "Id", "block", "Block"):
+        v = p.get(k)
+        if isinstance(v, (str, bytes)):
+            return v
+    ns_id = re.compile(r"[a-z0-9_.-]+:[a-z0-9_./-]+")
+    for v in p.values():  # any namespaced id value, e.g. {"block": "minecraft:rail"}
+        if isinstance(v, str) and ns_id.fullmatch(v):
+            return v
+    for k in p:  # or a namespaced id used as the key, e.g. {"minecraft:rail": {shape: ...}}
+        if ns_id.fullmatch(k):
+            return k
+    key = tuple(sorted(p.keys()))
+    UNNAMED_ENTRIES[key] += 1
+    UNNAMED_SAMPLES.setdefault(key, repr(p)[:200])
+    return "minecraft:air"
+
+
 def palette_name(p):
     """Block name from a palette entry, without namespace or block-state properties.
 
@@ -550,7 +575,11 @@ def palette_name(p):
     Handle both, plus a string that carries inline state like "minecraft:oak_log[axis=y]".
     """
     if isinstance(p, dict):
-        name = p.get("Name", "minecraft:air")
+        name = p.get("Name")
+        if not isinstance(name, (str, bytes)):
+            name = _name_from_compound(p)
+        if isinstance(name, bytes):
+            name = name.decode("utf-8", "replace")
     elif isinstance(p, (str, bytes)):
         name = p.decode("utf-8", "replace") if isinstance(p, bytes) else p
     else:
@@ -757,6 +786,8 @@ class Stats:
         self.errors = Counter()        # (stage, normalized message) -> chunks
         self.samples = {}              # same key -> [(cx, cz, full message), ...]
         self.log = []                  # every failure, if --error-log was given
+        self.unnamed = Counter()       # palette compound key-sets with no block name
+        self.unnamed_samples = {}
 
     def error(self, stage, msg, cx, cz, keep_log):
         key = (stage, _DIGITS.sub("#", msg))
@@ -774,6 +805,9 @@ class Stats:
             s = self.samples.setdefault(k, [])
             s.extend(v[:3 - len(s)])
         self.log.extend(o.log)
+        self.unnamed.update(o.unnamed)
+        for k, v in o.unnamed_samples.items():
+            self.unnamed_samples.setdefault(k, v)
 
     @property
     def error_count(self):
@@ -811,6 +845,10 @@ def process_region(path, opts):
                 out.append((cx, cz) + r)
     except Exception as e:
         st.error("region", f"{os.path.basename(path)}: {type(e).__name__}: {e}", 0, 0, keep_log)
+    st.unnamed.update(UNNAMED_ENTRIES)
+    st.unnamed_samples.update(UNNAMED_SAMPLES)
+    UNNAMED_ENTRIES.clear()
+    UNNAMED_SAMPLES.clear()
     return out, unknown, st, found
 
 
@@ -844,6 +882,10 @@ def print_diagnostics(st, files_count, rendered):
         print("Skipped (not errors):")
         for reason, n in st.skipped.most_common():
             print(f"  {n:>8,}  {reason}")
+    if st.unnamed:
+        print("WARNING: palette entries with no block name (drawn as air - please report):")
+        for key, n in st.unnamed.most_common(5):
+            print(f"  {n:>8,}  keys {list(key)}  e.g. {st.unnamed_samples[key]}")
     if st.errors:
         print("Errors, grouped by cause:")
         for (stage, _), n in st.errors.most_common():
@@ -1130,6 +1172,9 @@ def debug_chunk(region_dir, bx, bz, opts):
               f"{flag}  e.g. {', '.join(names[:5])}")
         if len(pal) > 1 and s.get("Y") == top_mixed:
             print(f"      raw palette entries (first 8): {list(pal[:8])!r}")
+        comp = [p for p in pal if isinstance(p, dict)]
+        if comp and s.get("Y") == top_mixed:
+            print(f"      compound entries ({len(comp)}), first 3: {comp[:3]!r}")
     try:
         dopts = dict(opts, _debug={})
         r = render_chunk(root, dopts, Counter())
@@ -1315,7 +1360,7 @@ def main():
         with open(args.error_log, "w", encoding="utf-8") as f:
             f.write("\n".join(sorted(stats.log)) + ("\n" if stats.log else ""))
         print(f"Wrote {len(stats.log):,} error line(s) to {args.error_log}")
-    if errors or args.diagnostics or not chunks:
+    if errors or stats.unnamed or args.diagnostics or not chunks:
         print_diagnostics(stats, len(files), len(chunks))
     if not chunks:
         sys.exit("No explored chunks found (try --include-partial).")
