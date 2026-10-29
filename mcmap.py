@@ -95,7 +95,14 @@ class _NBT:
             et = b[p]
             n = _S_i.unpack_from(b, p + 1)[0]
             self.p = p + 5
-            return [self._payload(et) for _ in range(max(n, 0))]
+            items = [self._payload(et) for _ in range(max(n, 0))]
+            if et == 10:
+                # Since 1.21.5 a list may mix element types. On disk that is written as a list
+                # of compounds, with each non-compound element wrapped as {"": value}.
+                # (Block palettes do this when some entries are bare names and some have
+                # Properties.) Unwrap those so callers see the real values.
+                items = [x[""] if len(x) == 1 and "" in x else x for x in items]
+            return items
         if t == 2:
             self.p = p + 2
             return _S_h.unpack_from(b, p)[0]
@@ -388,6 +395,21 @@ COLORS = {
     "chorus_plant": (93, 57, 93), "chorus_flower": (151, 120, 151),
     # common builds
     "glass": (200, 220, 230), "bricks": (150, 97, 83), "stone_bricks": (122, 121, 122),
+    "smooth_basalt": (72, 72, 78),
+    "polished_basalt": (99, 98, 100), "bone_block": (229, 225, 207), "sea_lantern": (172, 199, 190),
+    "spawner": (36, 46, 62), "chain": (54, 58, 67), "lantern": (106, 91, 83),
+    "soul_lantern": (71, 99, 114), "big_dripleaf_stem": (90, 115, 44), "cocoa": (150, 87, 26),
+    "sculk_sensor": (7, 70, 84), "sculk_catalyst": (15, 31, 38), "sculk_shrieker": (198, 205, 169),
+    "wheat": (166, 151, 73), "potatoes": (84, 135, 47), "carrots": (81, 124, 37),
+    "beetroots": (94, 120, 42), "melon_stem": (101, 140, 50), "pumpkin_stem": (101, 140, 50),
+    "bee_nest": (202, 160, 74), "fire": (217, 125, 29), "soul_fire": (51, 192, 198),
+    "campfire": (110, 88, 54), "composter": (112, 70, 31), "bell": (253, 229, 96),
+    "ochre_froglight": (250, 245, 206), "verdant_froglight": (229, 244, 228),
+    "pearlescent_froglight": (245, 240, 239), "cartography_table": (103, 87, 67),
+    "wet_sponge": (171, 181, 70), "nether_portal": (88, 15, 200), "brewing_stand": (122, 100, 80),
+    "carved_pumpkin": (198, 118, 24), "jack_o_lantern": (214, 152, 52),
+    "blast_furnace": (108, 108, 107), "smoker": (107, 106, 104), "lectern": (173, 137, 83),
+    "flower_pot": (124, 68, 53),
     "smooth_stone": (159, 159, 159), "quartz_block": (235, 229, 222), "bookshelf": (117, 94, 59),
     "crafting_table": (120, 73, 42), "furnace": (110, 110, 110), "chest": (162, 113, 47),
     "barrel": (135, 102, 58), "iron_block": (220, 220, 220), "gold_block": (246, 208, 61),
@@ -448,6 +470,10 @@ def block_color(name):
             rgb = DYE[dye]
             if "terracotta" in name and "glazed" not in name:
                 rgb = tuple(int(c * 0.6 + t * 0.4) for c, t in zip(rgb, (152, 94, 67)))
+        elif name.startswith("potted_"):
+            rgb = (124, 68, 53)
+        elif name.startswith("stripped_") and any(name[9:].startswith(w + "_") for w in WOOD):
+            rgb = WOOD[next(w for w in _WOOD_ORDER if name[9:].startswith(w + "_"))]
         elif wood and any(k in name for k in ("log", "wood", "stem", "hyphae")):
             rgb = (102, 81, 51) if wood not in ("crimson", "warped", "cherry", "pale_oak", "birch") \
                 else tuple(int(c * 0.8) for c in WOOD[wood])
