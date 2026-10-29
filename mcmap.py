@@ -477,7 +477,7 @@ def classify(name):
 # Chunk decoding
 # --------------------------------------------------------------------------------------
 
-def unpack_indices(data, palette_len, spanning, count=4096):
+def unpack_indices(data, palette_len, spanning, count=4096, clamp=True):
     """Decode a packed long array of palette indices."""
     if data is None or len(data) == 0 or palette_len <= 1:
         return np.zeros(count, dtype=np.intp)
@@ -500,6 +500,8 @@ def unpack_indices(data, palette_len, spanning, count=4096):
         vals &= mask
     if vals.size < count:
         vals = np.concatenate([vals, np.zeros(count - vals.size, dtype=np.uint64)])
+    if not clamp:
+        return vals[:count].astype(np.intp)
     return np.minimum(vals[:count], palette_len - 1).astype(np.intp)
 
 
@@ -516,6 +518,9 @@ def palette_name(p):
         name = p.decode("utf-8", "replace") if isinstance(p, bytes) else p
     else:
         name = "minecraft:air"
+    if name.lstrip().startswith("{"):  # SNBT compound written as a string
+        m = re.search(r'Name\s*:\s*"?([A-Za-z0-9_.:/-]+)', name)
+        name = m.group(1) if m else "minecraft:air"
     for sep in ("[", "{"):
         i = name.find(sep)
         if i >= 0:
@@ -605,6 +610,10 @@ def render_chunk(root, opts, unknown):
     surf_c = C[first, zz, xx]
     palette_rgb = np.array(colors, dtype=np.float32)
     rgb = palette_rgb[surf_c]
+    dbg = opts.get("_debug")
+    if dbg is not None:
+        by_id = list(local_ids)
+        dbg["surface"] = Counter(by_id[i] for i in surf_c[valid].ravel())
 
     water = valid & (surf_kind == 1)
     if water.any():
@@ -857,6 +866,10 @@ def debug_chunk(region_dir, bx, bz, opts):
         print(f"  Level keys: {sorted(level.keys())}")
     secs = level.get("sections") or level.get("Sections") or []
     print(f"  Sections: {len(secs)}")
+
+    def _pal(x):
+        return (x.get("block_states") or {}).get("palette") or x.get("Palette") or []
+    top_mixed = max((x.get("Y") for x in secs if len(_pal(x)) > 1), default=None)
     for s in secs:
         if "block_states" in s:
             pal, d = s["block_states"].get("palette"), s["block_states"].get("data")
@@ -872,11 +885,26 @@ def debug_chunk(region_dir, bx, bz, opts):
             print(f"    (Y={s.get('Y')} palette entries are {type(pal[0]).__name__}, e.g. {pal[0]!r})")
         dlen = 0 if d is None else len(d)
         flag = "" if len(pal) == 1 or dlen in (exp, (4096 * bits + 63) // 64) else "  <-- unexpected length"
+        if len(pal) > 1 and dlen:
+            raw_idx = unpack_indices(d, len(pal), root.get("DataVersion", 0) < 2529, clamp=False)
+            bad = int((raw_idx >= len(pal)).sum())
+            if bad:
+                flag += f"  <-- {bad} of 4096 indices exceed palette (max {int(raw_idx.max())})"
         print(f"    Y={s.get('Y'):>3}: palette {len(pal):>3}, data longs {dlen:>4} (expect {exp})"
               f"{flag}  e.g. {', '.join(names[:5])}")
+        if len(pal) > 1 and s.get("Y") == top_mixed:
+            print(f"      raw palette entries (first 8): {list(pal[:8])!r}")
     try:
-        r = render_chunk(root, opts, Counter())
+        dopts = dict(opts, _debug={})
+        r = render_chunk(root, dopts, Counter())
         print(f"  Render: {'skipped - ' + r if isinstance(r, str) else 'OK'}")
+        surf = dopts["_debug"].get("surface")
+        if surf:
+            print("  Surface blocks the map shows for this chunk (of 256 columns):")
+            for name, n in surf.most_common(15):
+                rgb, known = block_color(name)
+                tag = "" if known else "   <-- no color mapping, drawn as default gray"
+                print(f"    {n:>4}  {name:30s} rgb{rgb}{tag}")
     except Exception:
         print("  Render FAILED:")
         traceback.print_exc()
