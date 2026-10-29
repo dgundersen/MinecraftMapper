@@ -3,7 +3,7 @@ Minecraft world map generator.
 
 ## Rails
 
-Rails are drawn on the map (dark lines, with powered rails in gold).
+Rails are drawn on the map (silver lines, with powered rails in gold and detector/activator rails in red).
 
 | Option | Meaning |
 | --- | --- |
