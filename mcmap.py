@@ -503,6 +503,26 @@ def unpack_indices(data, palette_len, spanning, count=4096):
     return np.minimum(vals[:count], palette_len - 1).astype(np.intp)
 
 
+def palette_name(p):
+    """Block name from a palette entry, without namespace or block-state properties.
+
+    Older versions store each entry as a compound ({Name: "minecraft:stone", Properties: {...}});
+    newer versions (seen at DataVersion 5023 / 26.x) can store a plain string instead.
+    Handle both, plus a string that carries inline state like "minecraft:oak_log[axis=y]".
+    """
+    if isinstance(p, dict):
+        name = p.get("Name", "minecraft:air")
+    elif isinstance(p, (str, bytes)):
+        name = p.decode("utf-8", "replace") if isinstance(p, bytes) else p
+    else:
+        name = "minecraft:air"
+    for sep in ("[", "{"):
+        i = name.find(sep)
+        if i >= 0:
+            name = name[:i]
+    return name.strip().split(":", 1)[-1] or "air"
+
+
 def render_chunk(root, opts, unknown):
     """
     Returns (rgb[16,16,3] uint8, height[16,16] int16, valid[16,16] bool, water[16,16] bool)
@@ -529,7 +549,7 @@ def render_chunk(root, opts, unknown):
             pal, data = s.get("Palette"), s.get("BlockStates")
         if not pal:
             continue
-        names = [p.get("Name", "minecraft:air").split(":", 1)[-1] for p in pal]
+        names = [palette_name(p) for p in pal]
         if len(names) == 1 and names[0] in AIR:
             continue
         parsed[y] = (names, data)
@@ -683,7 +703,7 @@ def process_region(path, opts):
 
 # Rough DataVersion -> release mapping, for the diagnostics report.
 _DV_RELEASES = [(1519, "1.13"), (1952, "1.14"), (2225, "1.15"), (2566, "1.16"), (2724, "1.17"),
-                (2860, "1.18"), (3105, "1.19"), (3463, "1.20"), (3953, "1.21+")]
+                (2860, "1.18"), (3105, "1.19"), (3463, "1.20"), (3953, "1.21+ / 26.x")]
 
 
 def dv_label(dv):
@@ -847,7 +867,9 @@ def debug_chunk(region_dir, bx, bz, opts):
             continue
         bits = max(4, (len(pal) - 1).bit_length())
         exp = 0 if len(pal) == 1 else (4096 + 64 // bits - 1) // (64 // bits)
-        names = [p.get("Name", "?").split(":", 1)[-1] for p in pal]
+        names = [palette_name(p) for p in pal]
+        if pal and not isinstance(pal[0], dict):
+            print(f"    (Y={s.get('Y')} palette entries are {type(pal[0]).__name__}, e.g. {pal[0]!r})")
         dlen = 0 if d is None else len(d)
         flag = "" if len(pal) == 1 or dlen in (exp, (4096 * bits + 63) // 64) else "  <-- unexpected length"
         print(f"    Y={s.get('Y'):>3}: palette {len(pal):>3}, data longs {dlen:>4} (expect {exp})"
