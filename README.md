@@ -1,6 +1,21 @@
 # MinecraftMapper
 Minecraft world map generator.
 
+## Rails
+
+Rails are drawn on the map (dark lines, with powered rails in gold).
+
+| Option | Meaning |
+| --- | --- |
+| `--rails surface` | Default. Draw rails that are the top block in their column |
+| `--rails all` | Also draw covered rails: tunnels, under roofs or leaves, underwater |
+| `--rail-min-y Y` | With `--rails all`, ignore rails below Y (abandoned mineshafts are full of rails) |
+| `--buried-rail-color #RRGGBB` | With `--rails all`, a separate color for covered rails |
+| `--rails none` | Hide rails |
+
+Rail lines are one block wide, so they're clearest at `--scale 1` or higher; at smaller
+scales they get averaged with the terrain around them.
+
 ## Finding blocks
 
 `--find` lists the location of specific blocks (ores, spawners, chests and so on) in every

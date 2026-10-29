@@ -344,7 +344,7 @@ SEE_THROUGH = {
     "torchflower", "pitcher_plant", "pink_petals", "closed_eyeblossom", "open_eyeblossom",
     "torch", "wall_torch", "soul_torch", "soul_wall_torch", "redstone_torch",
     "redstone_wall_torch", "redstone_wire", "tripwire", "tripwire_hook", "string", "lever",
-    "rail", "powered_rail", "detector_rail", "activator_rail", "ladder", "vine", "cobweb",
+    "ladder", "vine", "cobweb",
     "sugar_cane", "sweet_berry_bush", "brown_mushroom", "red_mushroom", "nether_sprouts",
     "crimson_roots", "warped_roots", "glow_lichen", "sculk_vein", "hanging_roots",
     "spore_blossom", "cave_vines", "cave_vines_plant", "twisting_vines", "twisting_vines_plant",
@@ -359,7 +359,14 @@ WATERY = {"water", "bubble_column", "seagrass", "tall_seagrass", "kelp", "kelp_p
 
 WATER_RGB = (52, 87, 186)
 
+# Rails are drawn as solid surface blocks (they used to be looked through like grass),
+# so rail lines show up. Dark so a 1-block-wide line stands out on most terrain;
+# powered rails are gold so boosters are visible.
+RAILS = {"rail": (58, 48, 42), "powered_rail": (214, 168, 38),
+         "detector_rail": (150, 62, 50), "activator_rail": (150, 62, 50)}
+
 COLORS = {
+    **RAILS,
     # natural terrain
     "grass_block": (110, 158, 66), "dirt": (134, 96, 67), "coarse_dirt": (119, 85, 59),
     "rooted_dirt": (144, 103, 76), "podzol": (91, 63, 24), "mycelium": (111, 99, 105),
@@ -636,7 +643,7 @@ def render_chunk(root, opts, unknown, found=None, cx=0, cz=0):
                 if not known and classify(n) == 2:
                     unknown[n] += 1
             ids[i] = j
-            kinds[i] = classify(n)
+            kinds[i] = 0 if (n in RAILS and opts.get("rails") == "none") else classify(n)
         idx = unpack_indices(data, len(names), spanning).reshape(16, 16, 16)  # [y, z, x]
         r = (y - lo) * 16
         kind[r:r + 16] = kinds[idx]
@@ -708,6 +715,21 @@ def render_chunk(root, opts, unknown, found=None, cx=0, cz=0):
         wrgb = np.array(WATER_RGB, dtype=np.float32) * a + floor_rgb * (1 - a)
         dark = np.clip(1.08 - depth * 0.012, 0.6, 1.08)[..., None]
         rgb = np.where(water[..., None], wrgb * dark, rgb)
+
+    if opts.get("rails") == "all":
+        # Also show rails that are covered (tunnels, under roofs or leaves, underwater).
+        rail_ids = [j for n, j in local_ids.items() if n in RAILS]
+        if rail_ids:
+            mask = np.isin(C, rail_ids)
+            min_y = opts.get("rail_min_y")
+            if min_y is not None:
+                rows = top_world_y - np.arange(C.shape[0])
+                mask &= (rows >= min_y)[:, None, None]
+            buried = mask.any(axis=0) & valid & ~np.isin(surf_c, rail_ids)
+            if buried.any():
+                a = opts.get("buried_rail_alpha", 0.8)
+                rc = np.array(opts.get("buried_rail_rgb", RAILS["rail"]), dtype=np.float32)
+                rgb[buried] = rgb[buried] * (1 - a) + rc * a
 
     rgb[~valid] = 0
     return np.clip(rgb, 0, 255).astype(np.uint8), height, valid, water
@@ -1162,6 +1184,14 @@ def main():
                     help="Write every unreadable chunk and the reason to this file")
     ap.add_argument("--debug-chunk", nargs=2, type=int, metavar=("X", "Z"),
                     help="Dump details for the chunk at block X Z (from F3) and exit")
+    ap.add_argument("--rails", choices=["surface", "all", "none"], default="surface",
+                    help="surface: draw rails that are the top block (default); all: also draw "
+                         "rails in tunnels, under roofs or underwater; none: hide rails")
+    ap.add_argument("--rail-min-y", type=int, metavar="Y",
+                    help="With --rails all: ignore rails below this Y (e.g. 40 to skip "
+                         "abandoned mineshafts)")
+    ap.add_argument("--buried-rail-color", default=None, metavar="#RRGGBB",
+                    help="With --rails all: color for covered rails (default: same as rails)")
     fg = ap.add_argument_group("finding blocks")
     fg.add_argument("--find", metavar="BLOCKS",
                     help="Comma-separated block names to locate, wildcards allowed, "
@@ -1204,7 +1234,13 @@ def main():
         "keep_log": bool(args.error_log),
         "find": None,
         "find_only": False,
+        "rails": args.rails,
+        "rail_min_y": args.rail_min_y,
     }
+    if args.buried_rail_color:
+        opts["buried_rail_rgb"] = parse_color(args.buried_rail_color)[:3]
+    if (args.rail_min_y is not None or args.buried_rail_color) and args.rails != "all":
+        ap.error("--rail-min-y and --buried-rail-color need --rails all")
     if args.find:
         pats = [p.strip().lower().split(":", 1)[-1] for p in args.find.split(",") if p.strip()]
         if not pats:
