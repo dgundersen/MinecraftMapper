@@ -15,12 +15,16 @@ Examples:
     python mcmap.py ./world --list-unknown        # see which blocks fell back to the default color
     python mcmap.py ./world --error-log errors.txt  # list every unreadable chunk and why
     python mcmap.py ./world --debug-chunk 120 -340  # full dump of the chunk at block X=120 Z=-340
+    python mcmap.py ./world --find "*diamond_ore" --near 120 -340 --radius 500 --find-only
+    python mcmap.py ./world -d nether --find ancient_debris --near 0 0
 
 The world can be open in-game while this runs (files are only read), but chunks Minecraft
 hasn't flushed to disk yet won't appear. Close the world or run /save-all for a complete map.
 """
 
 import argparse
+import csv
+import fnmatch
 import gzip
 import os
 import re
@@ -95,7 +99,14 @@ class _NBT:
             et = b[p]
             n = _S_i.unpack_from(b, p + 1)[0]
             self.p = p + 5
-            return [self._payload(et) for _ in range(max(n, 0))]
+            items = [self._payload(et) for _ in range(max(n, 0))]
+            if et == 10:
+                # Since 1.21.5 a list may mix element types. On disk that is written as a list
+                # of compounds, with each non-compound element wrapped as {"": value}.
+                # (Block palettes do this when some entries are bare names and some have
+                # Properties.) Unwrap those so callers see the real values.
+                items = [x[""] if len(x) == 1 and "" in x else x for x in items]
+            return items
         if t == 2:
             self.p = p + 2
             return _S_h.unpack_from(b, p)[0]
@@ -388,6 +399,21 @@ COLORS = {
     "chorus_plant": (93, 57, 93), "chorus_flower": (151, 120, 151),
     # common builds
     "glass": (200, 220, 230), "bricks": (150, 97, 83), "stone_bricks": (122, 121, 122),
+    "smooth_basalt": (72, 72, 78),
+    "polished_basalt": (99, 98, 100), "bone_block": (229, 225, 207), "sea_lantern": (172, 199, 190),
+    "spawner": (36, 46, 62), "chain": (54, 58, 67), "lantern": (106, 91, 83),
+    "soul_lantern": (71, 99, 114), "big_dripleaf_stem": (90, 115, 44), "cocoa": (150, 87, 26),
+    "sculk_sensor": (7, 70, 84), "sculk_catalyst": (15, 31, 38), "sculk_shrieker": (198, 205, 169),
+    "wheat": (166, 151, 73), "potatoes": (84, 135, 47), "carrots": (81, 124, 37),
+    "beetroots": (94, 120, 42), "melon_stem": (101, 140, 50), "pumpkin_stem": (101, 140, 50),
+    "bee_nest": (202, 160, 74), "fire": (217, 125, 29), "soul_fire": (51, 192, 198),
+    "campfire": (110, 88, 54), "composter": (112, 70, 31), "bell": (253, 229, 96),
+    "ochre_froglight": (250, 245, 206), "verdant_froglight": (229, 244, 228),
+    "pearlescent_froglight": (245, 240, 239), "cartography_table": (103, 87, 67),
+    "wet_sponge": (171, 181, 70), "nether_portal": (88, 15, 200), "brewing_stand": (122, 100, 80),
+    "carved_pumpkin": (198, 118, 24), "jack_o_lantern": (214, 152, 52),
+    "blast_furnace": (108, 108, 107), "smoker": (107, 106, 104), "lectern": (173, 137, 83),
+    "flower_pot": (124, 68, 53),
     "smooth_stone": (159, 159, 159), "quartz_block": (235, 229, 222), "bookshelf": (117, 94, 59),
     "crafting_table": (120, 73, 42), "furnace": (110, 110, 110), "chest": (162, 113, 47),
     "barrel": (135, 102, 58), "iron_block": (220, 220, 220), "gold_block": (246, 208, 61),
@@ -448,6 +474,10 @@ def block_color(name):
             rgb = DYE[dye]
             if "terracotta" in name and "glazed" not in name:
                 rgb = tuple(int(c * 0.6 + t * 0.4) for c, t in zip(rgb, (152, 94, 67)))
+        elif name.startswith("potted_"):
+            rgb = (124, 68, 53)
+        elif name.startswith("stripped_") and any(name[9:].startswith(w + "_") for w in WOOD):
+            rgb = WOOD[next(w for w in _WOOD_ORDER if name[9:].startswith(w + "_"))]
         elif wood and any(k in name for k in ("log", "wood", "stem", "hyphae")):
             rgb = (102, 81, 51) if wood not in ("crimson", "warped", "cherry", "pale_oak", "birch") \
                 else tuple(int(c * 0.8) for c in WOOD[wood])
@@ -477,7 +507,7 @@ def classify(name):
 # Chunk decoding
 # --------------------------------------------------------------------------------------
 
-def unpack_indices(data, palette_len, spanning, count=4096):
+def unpack_indices(data, palette_len, spanning, count=4096, clamp=True):
     """Decode a packed long array of palette indices."""
     if data is None or len(data) == 0 or palette_len <= 1:
         return np.zeros(count, dtype=np.intp)
@@ -500,6 +530,8 @@ def unpack_indices(data, palette_len, spanning, count=4096):
         vals &= mask
     if vals.size < count:
         vals = np.concatenate([vals, np.zeros(count - vals.size, dtype=np.uint64)])
+    if not clamp:
+        return vals[:count].astype(np.intp)
     return np.minimum(vals[:count], palette_len - 1).astype(np.intp)
 
 
@@ -516,6 +548,9 @@ def palette_name(p):
         name = p.decode("utf-8", "replace") if isinstance(p, bytes) else p
     else:
         name = "minecraft:air"
+    if name.lstrip().startswith("{"):  # SNBT compound written as a string
+        m = re.search(r'Name\s*:\s*"?([A-Za-z0-9_.:/-]+)', name)
+        name = m.group(1) if m else "minecraft:air"
     for sep in ("[", "{"):
         i = name.find(sep)
         if i >= 0:
@@ -523,17 +558,44 @@ def palette_name(p):
     return name.strip().split(":", 1)[-1] or "air"
 
 
-def render_chunk(root, opts, unknown):
+# Generation steps at or after ore/feature placement (1.18+ names, then 1.13-1.17 names).
+# --find searches these chunks even if they aren't fully generated yet.
+FEATURES_DONE = {"features", "initialize_light", "light", "spawn", "full",
+                 "decorated", "lighted", "mobs_spawned", "finalized", "fullchunk", "postprocessed"}
+
+_find_cache = {}
+
+
+def find_match(name, patterns):
+    """Does a block name match any --find pattern (exact name or shell-style wildcard)?"""
+    hit = _find_cache.get(name)
+    if hit is None:
+        hit = _find_cache[name] = any(fnmatch.fnmatchcase(name, p) for p in patterns)
+    return hit
+
+
+def render_chunk(root, opts, unknown, found=None, cx=0, cz=0):
     """
     Returns (rgb[16,16,3] uint8, height[16,16] int16, valid[16,16] bool, water[16,16] bool)
     or a string explaining why the chunk was skipped (not generated, no blocks, ...).
     Arrays are indexed [z, x] within the chunk.
+
+    If opts["find"] is set and `found` is a list, (block_name, int32[N,3] of x,y,z) entries
+    are appended for every matching block. With opts["find_only"] the map work is skipped
+    and the string "find-only" is returned.
     """
     dv = root.get("DataVersion", 0)
     level = root["Level"] if "Level" in root else root
     status = str(level.get("Status", ""))
-    if not opts["include_partial"] and not status.endswith("full"):
-        return f"not fully generated (Status '{status or 'none'}')"
+    full = opts["include_partial"] or status.endswith("full")
+    patterns = opts.get("find")
+    searching = bool(patterns) and found is not None \
+        and status.split(":")[-1] in FEATURES_DONE
+    skip_reason = f"not fully generated (Status '{status or 'none'}')"
+    if opts.get("find_only") and not searching:
+        return "find-only"
+    if not full and not searching:
+        return skip_reason
 
     sections = level.get("sections") or level.get("Sections") or []
     spanning = dv < 2529  # before 20w17a (1.16), values could straddle longs
@@ -580,6 +642,29 @@ def render_chunk(root, opts, unknown):
         kind[r:r + 16] = kinds[idx]
         cid[r:r + 16] = ids[idx]
 
+    if searching:
+        y_lo, y_hi = opts.get("find_y", (None, None))
+        for name, j in local_ids.items():
+            if not find_match(name, patterns):
+                continue
+            pos = np.argwhere(cid == j)  # [row, z, x]
+            if not len(pos):
+                continue
+            xyz = np.empty((len(pos), 3), dtype=np.int32)
+            xyz[:, 0] = cx * 16 + pos[:, 2]
+            xyz[:, 1] = lo * 16 + pos[:, 0]
+            xyz[:, 2] = cz * 16 + pos[:, 1]
+            if y_lo is not None:
+                xyz = xyz[xyz[:, 1] >= y_lo]
+            if y_hi is not None:
+                xyz = xyz[xyz[:, 1] <= y_hi]
+            if len(xyz):
+                found.append((name, xyz))
+    if opts.get("find_only"):
+        return "find-only"
+    if not full:
+        return skip_reason
+
     top_world_y = lo * 16 + H - 1
     # Flip so row 0 is the highest block, then apply a ceiling if requested.
     K = kind[::-1]
@@ -605,6 +690,10 @@ def render_chunk(root, opts, unknown):
     surf_c = C[first, zz, xx]
     palette_rgb = np.array(colors, dtype=np.float32)
     rgb = palette_rgb[surf_c]
+    dbg = opts.get("_debug")
+    if dbg is not None:
+        by_id = list(local_ids)
+        dbg["surface"] = Counter(by_id[i] for i in surf_c[valid].ravel())
 
     water = valid & (surf_kind == 1)
     if water.any():
@@ -676,7 +765,7 @@ def process_region(path, opts):
     if bounds:
         x0, z0, x1, z1 = bounds
         flt = lambda cx, cz: x0 <= cx <= x1 and z0 <= cz <= z1  # noqa: E731
-    out, unknown, st = [], Counter(), Stats()
+    out, unknown, st, found = [], Counter(), Stats(), []
     try:
         for cx, cz, ctype, root in iter_region_chunks(path, flt):
             st.compression[COMPRESSION_NAMES.get(ctype, str(ctype))] += 1
@@ -685,20 +774,22 @@ def process_region(path, opts):
                 continue
             dv = root.get("DataVersion", 0) if isinstance(root, dict) else 0
             try:
-                r = render_chunk(root, opts, unknown)
+                r = render_chunk(root, opts, unknown, found, cx, cz)
             except Exception as e:
                 st.dv_err[dv] += 1
                 st.error("render", f"{type(e).__name__} at {_where(e)}: {e} (DataVersion {dv})",
                          cx, cz, keep_log)
                 continue
-            if isinstance(r, str):
+            if r == "find-only":
+                st.dv_ok[dv] += 1
+            elif isinstance(r, str):
                 st.skipped[r] += 1
             else:
                 st.dv_ok[dv] += 1
                 out.append((cx, cz) + r)
     except Exception as e:
         st.error("region", f"{os.path.basename(path)}: {type(e).__name__}: {e}", 0, 0, keep_log)
-    return out, unknown, st
+    return out, unknown, st, found
 
 
 # Rough DataVersion -> release mapping, for the diagnostics report.
@@ -805,6 +896,138 @@ def read_markers(world, dim):
     return markers
 
 
+# --------------------------------------------------------------------------------------
+# Block finder
+# --------------------------------------------------------------------------------------
+
+def block_family(name):
+    """Treat stone/deepslate variants of an ore as one block for vein grouping."""
+    return name[10:] if name.startswith("deepslate_") else name
+
+
+# The 13 "forward" neighbours of a block in a 3x3x3 cube; checking only these still
+# visits every touching pair once (the other 13 are covered from the other side).
+_FWD = [(dx, dy, dz) for dx in (-1, 0, 1) for dy in (-1, 0, 1) for dz in (-1, 0, 1)
+        if (dx, dy, dz) > (0, 0, 0)]
+
+
+def group_veins(names, xyz):
+    """
+    Group blocks into veins: same block family, touching on a face, edge or corner.
+    Returns an int array of vein ids (0..n-1), one per block.
+    """
+    n = len(xyz)
+    parent = list(range(n))
+
+    def root(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    fam = [block_family(nm) for nm in names]
+    index = {}
+    pts = xyz.tolist()
+    for i, (x, y, z) in enumerate(pts):
+        index[(x, y, z)] = i
+    for i, (x, y, z) in enumerate(pts):
+        for dx, dy, dz in _FWD:
+            j = index.get((x + dx, y + dy, z + dz))
+            if j is not None and fam[j] == fam[i]:
+                ri, rj = root(i), root(j)
+                if ri != rj:
+                    parent[rj] = ri
+    roots = np.fromiter((root(i) for i in range(n)), dtype=np.int64, count=n)
+    _, vein = np.unique(roots, return_inverse=True)
+    return vein
+
+
+def summarize_finds(found, near, radius):
+    """
+    Combine per-chunk hits, apply --near/--radius, group into veins.
+    Returns (blocks, veins): blocks = list of (x, y, z, name, vein_no),
+    veins = list of dicts sorted by distance (with --near) or by size.
+    """
+    if not found:
+        return [], []
+    names = []
+    for name, arr in found:
+        names.extend([name] * len(arr))
+    xyz = np.concatenate([arr for _, arr in found])
+    if near is not None:
+        d = np.hypot(xyz[:, 0] - near[0], xyz[:, 2] - near[1])
+        if radius is not None:
+            keep = d <= radius
+            xyz = xyz[keep]
+            names = [nm for nm, k in zip(names, keep) if k]
+    if not len(xyz):
+        return [], []
+    vein = group_veins(names, xyz)
+    veins = []
+    order = np.argsort(vein, kind="stable")
+    bounds = np.flatnonzero(np.diff(vein[order])) + 1
+    for members in np.split(order, bounds):
+        pts = xyz[members]
+        c = pts.mean(axis=0)
+        # Report a real ore block (nearest the vein's centre), so the spot is diggable.
+        rep_i = members[np.argmin(((pts - c) ** 2).sum(axis=1))]
+        counts = Counter(names[i] for i in members)
+        v = {
+            "block": "+".join(sorted(counts)),
+            "count": len(members),
+            "x": int(xyz[rep_i, 0]), "y": int(xyz[rep_i, 1]), "z": int(xyz[rep_i, 2]),
+            "min_y": int(pts[:, 1].min()), "max_y": int(pts[:, 1].max()),
+            "members": members,
+        }
+        if near is not None:
+            v["distance"] = round(float(np.hypot(v["x"] - near[0], v["z"] - near[1])), 1)
+        veins.append(v)
+    if near is not None:
+        veins.sort(key=lambda v: (v["distance"], -v["count"]))
+    else:
+        veins.sort(key=lambda v: (-v["count"], v["x"], v["z"]))
+    vein_no = np.empty(len(xyz), dtype=np.int64)
+    for n, v in enumerate(veins, 1):
+        v["vein"] = n
+        vein_no[v.pop("members")] = n
+    blocks = [(int(x), int(y), int(z), names[i], int(vein_no[i]))
+              for i, (x, y, z) in enumerate(xyz.tolist())]
+    blocks.sort(key=lambda b: (b[4], b[1], b[0], b[2]))
+    return blocks, veins
+
+
+def write_finds(path, blocks, veins, every_block, near):
+    dist = near is not None
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        if every_block:
+            w.writerow(["vein", "block", "x", "y", "z"])
+            for x, y, z, name, v in blocks:
+                w.writerow([v, name, x, y, z])
+        else:
+            w.writerow(["vein", "block", "count", "x", "y", "z", "min_y", "max_y"]
+                       + (["distance"] if dist else []))
+            for v in veins:
+                w.writerow([v["vein"], v["block"], v["count"], v["x"], v["y"], v["z"],
+                            v["min_y"], v["max_y"]] + ([v["distance"]] if dist else []))
+
+
+def print_finds(blocks, veins, near, out_path, top=10):
+    if not veins:
+        print("\nFind: no matching blocks.")
+        return
+    totals = Counter(b[3] for b in blocks)
+    print(f"\nFind: {len(blocks):,} block(s) in {len(veins):,} vein(s) -> {out_path}")
+    for name, n in totals.most_common():
+        print(f"  {name:30s} {n:,}")
+    label = "Nearest" if near is not None else "Largest"
+    print(f"{label} {min(top, len(veins))} vein(s):")
+    for v in veins[:top]:
+        extra = f", {v['distance']:,.0f} blocks away" if near is not None else ""
+        print(f"  #{v['vein']:<5} {v['count']:>3} x {v['block']:28s} at {v['x']}, {v['y']}, {v['z']}"
+              f"  (Y {v['min_y']}..{v['max_y']}{extra})")
+
+
 def debug_chunk(region_dir, bx, bz, opts):
     """Print everything we can learn about one chunk and save its bytes for inspection."""
     cx, cz = bx >> 4, bz >> 4
@@ -857,6 +1080,10 @@ def debug_chunk(region_dir, bx, bz, opts):
         print(f"  Level keys: {sorted(level.keys())}")
     secs = level.get("sections") or level.get("Sections") or []
     print(f"  Sections: {len(secs)}")
+
+    def _pal(x):
+        return (x.get("block_states") or {}).get("palette") or x.get("Palette") or []
+    top_mixed = max((x.get("Y") for x in secs if len(_pal(x)) > 1), default=None)
     for s in secs:
         if "block_states" in s:
             pal, d = s["block_states"].get("palette"), s["block_states"].get("data")
@@ -872,11 +1099,26 @@ def debug_chunk(region_dir, bx, bz, opts):
             print(f"    (Y={s.get('Y')} palette entries are {type(pal[0]).__name__}, e.g. {pal[0]!r})")
         dlen = 0 if d is None else len(d)
         flag = "" if len(pal) == 1 or dlen in (exp, (4096 * bits + 63) // 64) else "  <-- unexpected length"
+        if len(pal) > 1 and dlen:
+            raw_idx = unpack_indices(d, len(pal), root.get("DataVersion", 0) < 2529, clamp=False)
+            bad = int((raw_idx >= len(pal)).sum())
+            if bad:
+                flag += f"  <-- {bad} of 4096 indices exceed palette (max {int(raw_idx.max())})"
         print(f"    Y={s.get('Y'):>3}: palette {len(pal):>3}, data longs {dlen:>4} (expect {exp})"
               f"{flag}  e.g. {', '.join(names[:5])}")
+        if len(pal) > 1 and s.get("Y") == top_mixed:
+            print(f"      raw palette entries (first 8): {list(pal[:8])!r}")
     try:
-        r = render_chunk(root, opts, Counter())
+        dopts = dict(opts, _debug={})
+        r = render_chunk(root, dopts, Counter())
         print(f"  Render: {'skipped - ' + r if isinstance(r, str) else 'OK'}")
+        surf = dopts["_debug"].get("surface")
+        if surf:
+            print("  Surface blocks the map shows for this chunk (of 256 columns):")
+            for name, n in surf.most_common(15):
+                rgb, known = block_color(name)
+                tag = "" if known else "   <-- no color mapping, drawn as default gray"
+                print(f"    {n:>4}  {name:30s} rgb{rgb}{tag}")
     except Exception:
         print("  Render FAILED:")
         traceback.print_exc()
@@ -920,7 +1162,31 @@ def main():
                     help="Write every unreadable chunk and the reason to this file")
     ap.add_argument("--debug-chunk", nargs=2, type=int, metavar=("X", "Z"),
                     help="Dump details for the chunk at block X Z (from F3) and exit")
+    fg = ap.add_argument_group("finding blocks")
+    fg.add_argument("--find", metavar="BLOCKS",
+                    help="Comma-separated block names to locate, wildcards allowed, "
+                         "e.g. diamond_ore,deepslate_diamond_ore or '*diamond_ore'")
+    fg.add_argument("--find-out", metavar="FILE",
+                    help="CSV to write results to (default: <world>_<dim>_found.csv)")
+    fg.add_argument("--every-block", action="store_true",
+                    help="CSV lists every matching block instead of one row per vein")
+    fg.add_argument("--near", nargs=2, type=int, metavar=("X", "Z"),
+                    help="Sort results by horizontal distance from this point")
+    fg.add_argument("--radius", type=int, metavar="R",
+                    help="With --near: only keep results within R blocks")
+    fg.add_argument("--min-y", type=int, help="Only find blocks at or above this Y")
+    fg.add_argument("--max-y", type=int, help="Only find blocks at or below this Y")
+    fg.add_argument("--find-only", action="store_true",
+                    help="Just write the CSV; skip rendering the map")
+    fg.add_argument("--no-find-markers", action="store_true",
+                    help="Don't mark found veins on the map")
+    fg.add_argument("--find-color", default="#00E5FF", metavar="#RRGGBB",
+                    help="Marker color for found veins (default cyan)")
     args = ap.parse_args()
+    if args.radius is not None and args.near is None:
+        ap.error("--radius needs --near X Z")
+    if (args.find_only or args.every_block or args.near) and not args.find:
+        ap.error("--find-only, --every-block and --near need --find")
 
     world = os.path.abspath(os.path.expanduser(os.path.expandvars(args.world)))
     if not os.path.isdir(world):
@@ -936,7 +1202,16 @@ def main():
         "need_air_above": nether,
         "chunk_bounds": None,
         "keep_log": bool(args.error_log),
+        "find": None,
+        "find_only": False,
     }
+    if args.find:
+        pats = [p.strip().lower().split(":", 1)[-1] for p in args.find.split(",") if p.strip()]
+        if not pats:
+            ap.error("--find needs at least one block name")
+        opts["find"] = pats
+        opts["find_only"] = args.find_only
+        opts["find_y"] = (args.min_y, args.max_y)
     if args.debug_chunk:
         debug_chunk(region_dir, args.debug_chunk[0], args.debug_chunk[1], opts)
         return
@@ -945,6 +1220,10 @@ def main():
         x1, x2 = sorted((x1, x2))
         z1, z2 = sorted((z1, z2))
         opts["chunk_bounds"] = (x1 >> 4, z1 >> 4, x2 >> 4, z2 >> 4)
+    elif args.find_only and args.radius is not None:
+        # No map to draw, so only read the chunks inside the search radius.
+        nx, nz, r = args.near[0], args.near[1], args.radius
+        opts["chunk_bounds"] = ((nx - r) >> 4, (nz - r) >> 4, (nx + r) >> 4, (nz + r) >> 4)
 
     files = []
     for f in os.listdir(region_dir):
@@ -964,16 +1243,37 @@ def main():
     print(f"Reading {len(files)} region file(s) from {region_dir} using {args.workers} worker(s)...")
     if _lz4block is None:
         print("(lz4 package not installed - LZ4 chunks will use the slower built-in decoder)")
-    chunks, unknown, stats = [], Counter(), Stats()
+    chunks, unknown, stats, found = [], Counter(), Stats(), []
     with ProcessPoolExecutor(max_workers=args.workers) as pool:
         futs = [pool.submit(process_region, f, opts) for f in files]
         for n, fut in enumerate(as_completed(futs), 1):
-            c, u, st = fut.result()
+            c, u, st, fnd = fut.result()
             chunks.extend(c)
             unknown.update(u)
             stats.merge(st)
-            print(f"\r  {n}/{len(files)} regions, {len(chunks):,} chunks", end="", flush=True)
+            found.extend(fnd)
+            hits = sum(len(a) for _, a in found)
+            done = sum(stats.dv_ok.values()) if args.find_only else len(chunks)
+            print(f"\r  {n}/{len(files)} regions, {done:,} chunks"
+                  + (f", {hits:,} matching block(s)" if args.find else ""), end="", flush=True)
     print()
+    veins = []
+    base = os.path.basename(world.rstrip(os.sep))
+    if base == "region":  # pointed at a region folder: name outputs after the world folder
+        lvl = find_level_dat(world)
+        base = os.path.basename(os.path.dirname(lvl)) if lvl else base
+    if args.find:
+        blocks, veins = summarize_finds(found, args.near, args.radius)
+        del found
+        find_out = args.find_out or f"{base}_{args.dimension}_found.csv"
+        write_finds(find_out, blocks, veins, args.every_block, args.near)
+        print_finds(blocks, veins, args.near, find_out)
+        del blocks
+        if args.find_only:
+            if stats.error_count:
+                print_diagnostics(stats, len(files), 0)
+            print(f"Done in {time.time() - t0:.1f}s")
+            return
     errors = stats.error_count
     if args.error_log:
         with open(args.error_log, "w", encoding="utf-8") as f:
@@ -1061,6 +1361,20 @@ def main():
             draw.line([(0, Z), (img.width, Z)], fill=(0, 0, 0, 90), width=1)
             draw.text((3, Z + 3), f"z={gz}", fill=(0, 0, 0, 200))
             gz += g
+    if veins and not args.no_find_markers:
+        fc = parse_color(args.find_color)
+        r = max(2, int(3 * min(max(s, 0.5), 2)))
+        for v in reversed(veins):  # nearest/largest drawn last, on top
+            X, Z = to_px(v["x"] + 0.5, v["z"] + 0.5)
+            if 0 <= X < img.width and 0 <= Z < img.height:
+                draw.ellipse([X - r, Z - r, X + r, Z + r], fill=fc, outline=(0, 0, 0, 255))
+        if args.near:
+            X, Z = to_px(args.near[0] + 0.5, args.near[1] + 0.5)
+            draw.line([(X - 8, Z), (X + 8, Z)], fill=(255, 255, 255, 255), width=3)
+            draw.line([(X, Z - 8), (X, Z + 8)], fill=(255, 255, 255, 255), width=3)
+            if args.radius:
+                R = args.radius * s
+                draw.ellipse([X - R, Z - R, X + R, Z + R], outline=(255, 255, 255, 200), width=2)
     if not args.no_markers:
         for label, mx, mz, color in read_markers(world, args.dimension):
             X, Z = to_px(mx + 0.5, mz + 0.5)
@@ -1073,7 +1387,7 @@ def main():
                       stroke_width=2, stroke_fill=(0, 0, 0, 255))
     img = Image.alpha_composite(img, overlay)
 
-    out = args.output or f"{os.path.basename(world.rstrip(os.sep))}_{args.dimension}.png"
+    out = args.output or f"{base}_{args.dimension}.png"
     img.save(out, optimize=False)
     print(f"Saved {out}  ({img.width}x{img.height} px, {time.time() - t0:.1f}s)")
     print(f"Top-left pixel = block X {origin_x}, Z {origin_z}; {s:g} pixel(s) per block.")
